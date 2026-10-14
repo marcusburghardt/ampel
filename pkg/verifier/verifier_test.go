@@ -333,3 +333,159 @@ func TestSkipUnmatchedPredicatePolicy(t *testing.T) {
 	require.Equal(t, papi.StatusSKIP, resB.GetEvalResults()[0].GetStatus())
 	require.Contains(t, resB.GetEvalResults()[0].GetAssessment().GetMessage(), "no attestations match")
 }
+
+func TestEnforceOFFProducesSoftfail(t *testing.T) {
+	t.Parallel()
+
+	// A policy with enforce OFF and an unconstrained tenet that always fails.
+	// Because predicate types are unconstrained the mismatch check does not
+	// fire, the tenet evaluates and fails, and AssertResult downgrades the
+	// FAIL to SOFTFAIL.
+	policy := &papi.Policy{
+		Id:   "enforce-off-fail",
+		Meta: &papi.Meta{Enforce: "OFF"},
+		Tenets: []*papi.Tenet{{
+			Id:   "t1",
+			Code: "false",
+			Error: &papi.Error{
+				Message: "expected failure",
+			},
+		}},
+	}
+
+	set := &papi.PolicySet{
+		Id:       "softfail-set",
+		Policies: []*papi.Policy{policy},
+	}
+
+	ampel, err := New()
+	require.NoError(t, err)
+
+	rs, err := ampel.VerifySubjectWithPolicySet(
+		context.Background(), whenTestOptions(), set, whenTestSubject(),
+	)
+	require.NoError(t, err)
+	require.Len(t, rs.GetResults(), 1)
+
+	res := rs.GetResults()[0]
+	require.Equal(t, papi.StatusSOFTFAIL, res.GetStatus(),
+		"enforce OFF must downgrade FAIL to SOFTFAIL when tenet evaluation fails")
+	require.Equal(t, "enforce-off-fail", res.GetPolicy().GetId())
+}
+
+func TestEnforceOFFMismatchedPredicatesProducesSkip(t *testing.T) {
+	t.Parallel()
+
+	// A policy with enforce OFF that declares a predicate type not present
+	// in the available attestations. The predicate-type mismatch check fires
+	// before AssertResult, producing SKIP instead of SOFTFAIL.
+	policy := &papi.Policy{
+		Id:   "enforce-off-mismatch",
+		Meta: &papi.Meta{Enforce: "OFF"},
+		Tenets: []*papi.Tenet{{
+			Id:   "t1",
+			Code: "false",
+			Predicates: &papi.PredicateSpec{
+				Types: []string{"https://example.com/nonexistent"},
+			},
+			Error: &papi.Error{
+				Message: "should never run",
+			},
+		}},
+	}
+
+	set := &papi.PolicySet{
+		Id:       "skip-not-softfail-set",
+		Policies: []*papi.Policy{policy},
+	}
+
+	ampel, err := New()
+	require.NoError(t, err)
+
+	rs, err := ampel.VerifySubjectWithPolicySet(
+		context.Background(), whenTestOptions(), set, whenTestSubject(),
+	)
+	require.NoError(t, err)
+	require.Len(t, rs.GetResults(), 1)
+
+	res := rs.GetResults()[0]
+	require.Equal(t, papi.StatusSKIP, res.GetStatus(),
+		"SKIP must take precedence over SOFTFAIL when predicate types do not match")
+	require.Equal(t, "enforce-off-mismatch", res.GetPolicy().GetId())
+
+	require.Len(t, res.GetEvalResults(), 1)
+	require.Equal(t, "predicate-match", res.GetEvalResults()[0].GetId())
+	require.Equal(t, papi.StatusSKIP, res.GetEvalResults()[0].GetStatus())
+}
+
+func TestMixedSetWithSkipAndSoftfail(t *testing.T) {
+	t.Parallel()
+
+	// Policy A: unconstrained, always passes.
+	policyA := &papi.Policy{
+		Id:   "pass-policy",
+		Meta: &papi.Meta{},
+		Tenets: []*papi.Tenet{{
+			Id:         "t1",
+			Code:       "true",
+			Assessment: &papi.Assessment{Message: "all good"},
+		}},
+	}
+
+	// Policy B: enforce OFF, declares an unmatched predicate type -> SKIP.
+	policyB := &papi.Policy{
+		Id:   "skip-policy",
+		Meta: &papi.Meta{Enforce: "OFF"},
+		Tenets: []*papi.Tenet{{
+			Id:   "t1",
+			Code: "false",
+			Predicates: &papi.PredicateSpec{
+				Types: []string{"https://example.com/missing-type"},
+			},
+		}},
+	}
+
+	// Policy C: enforce OFF, unconstrained, tenet fails -> SOFTFAIL.
+	policyC := &papi.Policy{
+		Id:   "softfail-policy",
+		Meta: &papi.Meta{Enforce: "OFF"},
+		Tenets: []*papi.Tenet{{
+			Id:   "t1",
+			Code: "false",
+			Error: &papi.Error{
+				Message: "soft failure",
+			},
+		}},
+	}
+
+	set := &papi.PolicySet{
+		Id:       "mixed-set",
+		Policies: []*papi.Policy{policyA, policyB, policyC},
+	}
+
+	ampel, err := New()
+	require.NoError(t, err)
+
+	rs, err := ampel.VerifySubjectWithPolicySet(
+		context.Background(), whenTestOptions(), set, whenTestSubject(),
+	)
+	require.NoError(t, err)
+
+	// The set should PASS: SKIP and SOFTFAIL are non-blocking.
+	require.Equal(t, papi.StatusPASS, rs.GetStatus(),
+		"SKIP and SOFTFAIL must not block the policy set from passing")
+
+	require.Len(t, rs.GetResults(), 3)
+
+	resA := rs.GetResults()[0]
+	require.Equal(t, papi.StatusPASS, resA.GetStatus())
+	require.Equal(t, "pass-policy", resA.GetPolicy().GetId())
+
+	resB := rs.GetResults()[1]
+	require.Equal(t, papi.StatusSKIP, resB.GetStatus())
+	require.Equal(t, "skip-policy", resB.GetPolicy().GetId())
+
+	resC := rs.GetResults()[2]
+	require.Equal(t, papi.StatusSOFTFAIL, resC.GetStatus())
+	require.Equal(t, "softfail-policy", resC.GetPolicy().GetId())
+}
